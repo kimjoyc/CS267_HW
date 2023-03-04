@@ -1,6 +1,0 @@
-/home/joyce/hw1/build/CMakeFiles/benchmark.dir
-/home/joyce/hw1/build/CMakeFiles/benchmark-naive.dir
-/home/joyce/hw1/build/CMakeFiles/benchmark-blocked.dir
-/home/joyce/hw1/build/CMakeFiles/benchmark-blas.dir
-/home/joyce/hw1/build/CMakeFiles/edit_cache.dir
-/home/joyce/hw1/build/CMakeFiles/rebuild_cache.dir

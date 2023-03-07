@@ -4,22 +4,19 @@
 #SBATCH -q debug
 #SBATCH -J mpitest
 #SBATCH --ntasks-per-node=64
-#SBATCH -t 00:30:00
+#SBATCH -t 0:30:00
 
 #run the application:
 
 srun -N 1 --ntasks-per-node=64 ./mpi -n 6000000 -s 1 -o mpi_1.out
-srun -N 2 --ntasks-per-node=64 ./mpi -n 6000000 -s 1 -o mpi_2.out
 
-
-
-
+num="1000 10000 100000 1000000"
+proc="2 20 40 64"
 for i in $num 
 do
     for j in $proc
-    do 
-        srun -N 1 --ntasks-per-node=$p ./mpi -n $i >> mpi_1_results.out
-        srun -N 2 --ntasks-per-node=$p ./mpi -n $i >> mpi_2_results.out
-
+    do
+        echo $i
+        srun -N 1 --ntasks-per-node=$j ./mpi -n $i >> mpi_1_results.out
     done
 done

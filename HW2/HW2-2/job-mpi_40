@@ -1,0 +1,19 @@
+#!/bin/bash
+#SBATCH -N 1
+#SBATCH -C cpu
+#SBATCH -q debug
+#SBATCH -J mpitest
+#SBATCH --ntasks-per-node=40
+#SBATCH -t 0:30:00
+
+
+#run the application:
+
+srun -N 1 --ntasks-per-node=40 ./mpi -n 1000 -s 1 -o mpi_1_40.out
+
+num="1000 10000 100000 1000000 6000000"
+
+for i in $num 
+    do
+        srun -N 1 --ntasks-per-node=40 ./mpi -n $i >> mpi_1_40_results.out
+    done

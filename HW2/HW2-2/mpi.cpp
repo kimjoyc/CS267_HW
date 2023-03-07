@@ -1,6 +1,3 @@
-#include <unistd.h>
-#include <stdio.h>
-#include <assert.h>
 #include "common.h"
 #include <mpi.h>
 #include <cmath>
@@ -9,7 +6,7 @@
 #include <unordered_set>
 
 // Put any static global variables here that you will use throughout the simulation.
-const double grid_step = cutoff*1.0001;
+const double grid_step = cutoff*1.00001;
 int g_lda;
 int g_dims[2], g_coords[2], g_xd, g_yd, g_x0, g_y0;
 MPI_Comm g_comm;
@@ -284,7 +281,6 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
     neighbor_exchange(Dim_Y);
     receive_particles(parts, particle_containers, particle_grid, Dim_Y, Dir_Down, false, Ghost);
     receive_particles(parts, particle_containers, particle_grid, Dim_Y, Dir_Up, false, Ghost);
-    MPI_Barrier(g_comm);
     // Compute Forces
     for (int gy = 1; gy < g_yd+3; ++gy) {
       for (int gx = 1; gx < g_xd+3; ++gx) {
@@ -340,7 +336,6 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
         unlinkParticle(particle_containers+p_i);
     }
     g_ghosts.clear();
-    MPI_Barrier(g_comm);
     // Exchange moved particles.
     // Step 1: exchange along dimension 0.
     neighbor_exchange(Dim_X);

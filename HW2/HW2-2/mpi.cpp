@@ -24,11 +24,51 @@ struct ParticleContainer : ParticleContainerPredecessor {
     particle_t* p = nullptr;
     int g_i;
 };
+enum ParticleKind {
+    Owned,
+    Ghost
+};
 ParticleContainerPredecessor* particle_grid;
 ParticleContainer* particle_containers;
 std::unordered_set<int> g_parts, g_ghosts;
-std::vector<particle_t> x_send_down, x_send_up, y_send_down, y_send_up,
-    x_recv_down, x_recv_up, y_recv_down, y_recv_up;
+
+enum Dimension {
+    Dim_X = 0,
+    Dim_Y = 1,
+    Dims = 2
+};
+enum Direction {
+    Dir_Down = 0,
+    Dir_Up = 1,
+    Dirs = 2
+};
+struct Neighbor {
+    particle_t* send = nullptr;
+    particle_t* recv = nullptr;
+    int send_count = 0;
+    int recv_count = 0;
+    MPI_Request send_req, recv_req;
+    MPI_Status send_status, recv_status;
+    int rank;
+    void push(particle_t& p) {
+        //if (send != nullptr)
+            send[send_count++] = p;
+    }
+    void begin_send() {
+        MPI_Issend(send, send_count, PARTICLE, rank, 0, g_comm, &send_req);
+    }
+    void finish_send() {
+        MPI_Wait(&send_req, MPI_STATUS_IGNORE);
+        send_count = 0;
+    }
+    void receive() {
+        MPI_Probe(rank, MPI_ANY_TAG, g_comm, &recv_status);
+        MPI_Get_count(&recv_status, PARTICLE, &recv_count);
+        MPI_Recv(recv, recv_count, PARTICLE, rank, MPI_ANY_TAG, g_comm, &recv_status);
+    }
+};
+Neighbor neighbors[Dims][Dirs];
+
 
 static void inline __attribute__((always_inline))
 linkParticle(ParticleContainerPredecessor* pred, ParticleContainer* pc) {
@@ -65,13 +105,13 @@ apply_force(particle_t& p, particle_t& p_prime) {
     double coef = (1 - cutoff / r) / r2 / mass;
     p.ax += coef * dx;
     p.ay += coef * dy;
-//    p_prime.ax -= coef * dx;
-//    p_prime.ay -= coef * dy;
+    p_prime.ax -= coef * dx;
+    p_prime.ay -= coef * dy;
 }
 
 static void inline __attribute__((always_inline))
 apply_intercell_force(particle_t* const p, const int x_prime, const int y_prime) {
-    int i_prime = x_prime+(g_xd+2)*y_prime;
+    int i_prime = x_prime+(g_xd+4)*y_prime;
     for(ParticleContainer* pc_prime = particle_grid[i_prime].next; pc_prime != nullptr; pc_prime = pc_prime->next) {
         particle_t* p_prime = pc_prime->p;
         apply_force(*p, *p_prime);
@@ -105,17 +145,25 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
     // You can use this space to initialize data objects that you may need
     // This function will be called once before the algorithm begins
     // Do not do any particle simulation here
-    MPI_Dims_create(num_procs, 2, g_dims);
+    MPI_Dims_create(num_procs, Dims, g_dims);
     int periods[2] = {false, false};
-    MPI_Cart_create(MPI_COMM_WORLD, 2, g_dims, periods, false, &g_comm);
-    MPI_Cart_coords(g_comm, rank, 2, g_coords);
+    MPI_Cart_create(MPI_COMM_WORLD, Dims, g_dims, periods, false, &g_comm);
+    MPI_Cart_coords(g_comm, rank, Dims, g_coords);
+    for (int dim = 0; dim < Dims; ++dim) {
+      MPI_Cart_shift(g_comm, dim, 1, &neighbors[dim][0].rank, &neighbors[dim][1].rank);
+      for (int dir = 0; dir < Dirs; ++dir) {
+        neighbors[dim][dir].send = new particle_t[num_parts];
+        neighbors[dim][dir].recv = new particle_t[num_parts];
+      }
+    }
+
     g_lda = static_cast<int>(size/grid_step)+1;
     g_xd = (g_lda+g_dims[0]-1)/g_dims[0];
     g_yd = (g_lda+g_dims[1]-1)/g_dims[1];
     g_x0 = g_coords[0]*g_xd;
     g_y0 = g_coords[1]*g_yd;
 
-    particle_grid = new ParticleContainerPredecessor[(g_xd+2)*(g_yd+2)]();
+    particle_grid = new ParticleContainerPredecessor[(g_xd+4)*(g_yd+4)]();
     particle_containers = new ParticleContainer[num_parts]();
 
     for (int p_i = 0; p_i < num_parts; ++p_i) {
@@ -126,7 +174,7 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
         int g_y = static_cast<int>(p->y / grid_step)-g_y0;
         if (0 <= g_x && g_x < g_xd && 0 <= g_y && g_y < g_yd) {
             g_parts.insert(p_i);
-            int g_i = g_x+1+(g_xd+2)*(g_y+1);
+            int g_i = g_x+2+(g_xd+4)*(g_y+2);
             pc->p = p;
             pc->g_i = g_i;
             ParticleContainerPredecessor* g = particle_grid+g_i;
@@ -136,112 +184,123 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
 }
 
 static void inline __attribute__((always_inline))
-shift_exchange(
-    int dimension, int displacement,
-    std::vector<particle_t>& send,
-    std::vector<particle_t>& recv,
-    int x_lo, int x_hi,
-    int y_lo, int y_hi)
+push_ghosts(
+    Dimension dim, Direction dir)
 {
-    int incoming, outgoing;
-    MPI_Cart_shift(g_comm, dimension, displacement, &incoming, &outgoing);
-    if (outgoing != MPI_PROC_NULL)
-        for (int gy = y_lo; gy < y_hi; ++gy) {
-          for (int gx = x_lo; gx < x_hi; ++gx) {
-            int i = gx+(g_xd+2)*gy;
+    Neighbor& outgoing = neighbors[dim][dir];
+    if (outgoing.rank != MPI_PROC_NULL) {
+        int x_lo = dim == Dim_X && dir == Dir_Up ? g_xd-1 : 0;
+        int x_hi = dim == Dim_X && dir == Dir_Down ? 0 : g_xd-1;
+        int y_lo = dim == Dim_Y && dir == Dir_Up ? g_yd-1 : 0;
+        int y_hi = dim == Dim_Y && dir == Dir_Down ? 0 : g_yd-1;
+        for (int gy = 2+y_lo; gy <= 2+y_hi; ++gy) {
+          for (int gx = 2+x_lo; gx <= 2+x_hi; ++gx) {
+            int i = gx+(g_xd+4)*gy;
             for (ParticleContainer* pc = particle_grid[i].next; pc != nullptr; pc = pc->next) {
                 particle_t* p = pc->p;
-                send.push_back(*p);
+                outgoing.push(*p);
             }
           }
         }
-    MPI_Request sendreq;
-    MPI_Isend(send.data(), send.size(), PARTICLE, outgoing, 0, g_comm, &sendreq);
-    MPI_Status recv_status;
-    int recv_count;
-    MPI_Probe(incoming, MPI_ANY_TAG, g_comm, &recv_status);
-    MPI_Get_count(&recv_status, PARTICLE, &recv_count);
-    int recv_offset = recv.size();
-    recv.resize(recv_offset+recv_count);
-    MPI_Recv(&recv[recv_offset], recv_count, PARTICLE, incoming, MPI_ANY_TAG, g_comm, &recv_status);
-    MPI_Wait(&sendreq, MPI_STATUS_IGNORE);
+    }
+}
+
+static void inline __attribute__((always_inline))
+neighbor_exchange(
+    Dimension dim)
+{
+    Neighbor& neighbor_down = neighbors[dim][Dir_Down];
+    Neighbor& neighbor_up = neighbors[dim][Dir_Up];
+    neighbor_down.begin_send();
+    neighbor_up.receive();
+    neighbor_down.finish_send();
+    neighbor_up.begin_send();
+    neighbor_down.receive();
+    neighbor_up.finish_send();
 }
 
 static void inline __attribute__((always_inline))
 receive_particles(
     particle_t* parts, ParticleContainer* particle_containers, ParticleContainerPredecessor* particle_grid,
-    std::vector<particle_t>& recv,
-    bool pass_y, bool ghost)
+    Dimension dim, Direction dir,
+    bool pass_y, ParticleKind kind)
 {
-    for (const auto& p_recv: recv) {
-        int p_i = p_recv.id - 1;
+    Neighbor& incoming = neighbors[dim][dir];
+    if (incoming.rank == MPI_PROC_NULL)
+        return;
+    for (particle_t* p_recv = incoming.recv; p_recv != incoming.recv+incoming.recv_count; ++p_recv) {
+        int p_i = p_recv->id - 1;
         ParticleContainer* pc = particle_containers+p_i;
         particle_t* p = parts+p_i;
-        int g_x = static_cast<int>(p_recv.x / grid_step)-g_x0;
-        int g_y = static_cast<int>(p_recv.y / grid_step)-g_y0;
+        int g_x = static_cast<int>(p_recv->x / grid_step)-g_x0;
+        int g_y = static_cast<int>(p_recv->y / grid_step)-g_y0;
+        p_recv->ax = p_recv->ay = 0;
         if (pass_y) {
-            if (g_y < 0) {
-                y_send_down.push_back(p_recv);
+            if (kind != Ghost) {
+              if (g_y < 0) {
+                neighbors[Dim_Y][Dir_Down].push(*p_recv);
                 continue;
-            } else if (g_y >= g_yd) {
-                y_send_up.push_back(p_recv);
+              } else if (g_y >= g_yd) {
+                neighbors[Dim_Y][Dir_Up].push(*p_recv);
                 continue;
+              }
+            } else {
+              if (g_y <= 0) {
+                neighbors[Dim_Y][Dir_Down].push(*p_recv);
+              } else if (g_y >= g_yd-1) {
+                neighbors[Dim_Y][Dir_Up].push(*p_recv);
+              }
             }
         }
         if (-1 <= g_x && g_x < g_xd+1 && -1 <= g_y && g_y < g_yd+1) {
             if (0 <= g_x && g_x < g_xd && 0 <= g_y && g_y < g_yd) {
                 g_parts.insert(p_i);
-            } else if (ghost) {
+            } else if (kind == Ghost) {
                 g_ghosts.insert(p_i);
             }
-            *p = p_recv;
+            *p = *p_recv;
             pc->p = p;
-            int g_i = g_x+1+(g_xd+2)*(g_y+1);
+            int g_i = g_x+2+(g_xd+4)*(g_y+2);
             pc->g_i = g_i;
             ParticleContainerPredecessor* g = particle_grid+g_i;
             linkParticle(g, pc);
         }
     }
-    recv.resize(0);
+    incoming.recv_count = 0;
 }
 
 void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, int num_procs) 
 {
     // Exchange ghost particles.
     // Step 1: exchange along dimension 0.
-    shift_exchange(0, -1, x_send_down, x_recv_up, 1, 2, 1, g_yd+1);
-    shift_exchange(0, 1, x_send_up, x_recv_down, g_xd, g_xd+1, 1, g_yd+1);
+    push_ghosts(Dim_X, Dir_Down);
+    push_ghosts(Dim_X, Dir_Up);
+    neighbor_exchange(Dim_X);
+    receive_particles(parts, particle_containers, particle_grid, Dim_X, Dir_Down, true, Ghost);
+    receive_particles(parts, particle_containers, particle_grid, Dim_X, Dir_Up, true, Ghost);
     // Step 2: exchange along dimension 1, including incoming particles from step 1.
-    shift_exchange(1, -1, y_send_down, y_recv_up, 1, g_xd+1, 1, 2);
-    shift_exchange(1, -1, x_recv_down, y_recv_up, 0, 0, 0, 0);
-    shift_exchange(1, -1, x_recv_up, y_recv_up, 0, 0, 0, 0);
-    shift_exchange(1, 1, y_send_up, y_recv_down, 1, g_xd+1, g_yd, g_yd+1);
-    shift_exchange(1, 1, x_recv_down, y_recv_down, 0, 0, 0, 0);
-    shift_exchange(1, 1, x_recv_up, y_recv_down, 0, 0, 0, 0);
-    receive_particles(parts, particle_containers, particle_grid, x_recv_down, false, true);
-    receive_particles(parts, particle_containers, particle_grid, x_recv_up, false, true);
-    receive_particles(parts, particle_containers, particle_grid, y_recv_down, false, true);
-    receive_particles(parts, particle_containers, particle_grid, y_recv_up, false, true);
-    x_send_down.resize(0); x_send_up.resize(0);
-    y_send_down.resize(0); y_send_up.resize(0);
+    push_ghosts(Dim_Y, Dir_Down);
+    push_ghosts(Dim_Y, Dir_Up);
+    neighbor_exchange(Dim_Y);
+    receive_particles(parts, particle_containers, particle_grid, Dim_Y, Dir_Down, false, Ghost);
+    receive_particles(parts, particle_containers, particle_grid, Dim_Y, Dir_Up, false, Ghost);
     MPI_Barrier(g_comm);
     // Compute Forces
-    for (int gy = 1; gy < g_yd+1; ++gy) {
-      for (int gx = 1; gx < g_xd+1; ++gx) {
-        int i = gx+(g_xd+2)*gy;
+    for (int gy = 1; gy < g_yd+3; ++gy) {
+      for (int gx = 1; gx < g_xd+3; ++gx) {
+        int i = gx+(g_xd+4)*gy;
         for (ParticleContainer* pc = particle_grid[i].next; pc != nullptr; pc = pc->next) {
             particle_t* p = pc->p;
-            p->ax = p->ay = 0;
             apply_intercell_force(p, gx-1, gy-1);
             apply_intercell_force(p, gx, gy-1);
             apply_intercell_force(p, gx+1, gy-1);
             apply_intercell_force(p, gx-1, gy);
-            apply_intercell_force(p, gx, gy);
-            apply_intercell_force(p, gx+1, gy);
-            apply_intercell_force(p, gx-1, gy+1);
-            apply_intercell_force(p, gx, gy+1);
-            apply_intercell_force(p, gx+1, gy+1);
-//            for (ParticleContainer* pc_prime = pc->next; pc_prime != nullptr; pc_prime = pc_prime->next) apply_force(*p, *pc_prime->p);
+//            apply_intercell_force(p, gx, gy);
+//            apply_intercell_force(p, gx+1, gy);
+//            apply_intercell_force(p, gx-1, gy+1);
+//            apply_intercell_force(p, gx, gy+1);
+//            apply_intercell_force(p, gx+1, gy+1);
+            for (ParticleContainer* pc_prime = pc->next; pc_prime != nullptr; pc_prime = pc_prime->next) apply_force(*p, *pc_prime->p);
         }
       }
     }
@@ -251,21 +310,22 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
         ParticleContainer* pc = particle_containers+p_i;
         particle_t* p = parts+p_i;
         move(*p, size);
+            p->ax = p->ay = 0;
         int g_x_prime = static_cast<int>(p->x / grid_step)-g_x0;
         int g_y_prime = static_cast<int>(p->y / grid_step)-g_y0;
-        int g_i_prime = g_x_prime+1+(g_xd+2)*(g_y_prime+1);
+        int g_i_prime = g_x_prime+2+(g_xd+4)*(g_y_prime+2);
         if (pc->g_i != g_i_prime) {
             if (g_x_prime < 0 || g_x_prime >= g_xd || g_y_prime < 0 || g_y_prime >= g_yd) {
               unlinkParticle(pc);
               it = g_parts.erase(it);
               if (g_x_prime < 0) {
-                x_send_down.push_back(*p);
+                neighbors[Dim_X][Dir_Down].push(*p);
               } else if (g_x_prime >= g_xd) {
-                x_send_up.push_back(*p);
+                neighbors[Dim_X][Dir_Up].push(*p);
               } else if (g_y_prime < 0) {
-                y_send_down.push_back(*p);
+                neighbors[Dim_Y][Dir_Down].push(*p);
               } else if (g_y_prime >= g_yd) {
-                y_send_up.push_back(*p);
+                neighbors[Dim_Y][Dir_Up].push(*p);
               }
               continue;
             }
@@ -283,17 +343,13 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
     MPI_Barrier(g_comm);
     // Exchange moved particles.
     // Step 1: exchange along dimension 0.
-    shift_exchange(0, -1, x_send_down, x_recv_up, 0, 0, 0, 0);
-    shift_exchange(0, 1, x_send_up, x_recv_down, 0, 0, 0, 0);
-    receive_particles(parts, particle_containers, particle_grid, x_recv_down, true, false);
-    receive_particles(parts, particle_containers, particle_grid, x_recv_up, true, false);
+    neighbor_exchange(Dim_X);
+    receive_particles(parts, particle_containers, particle_grid, Dim_X, Dir_Down, true, Owned);
+    receive_particles(parts, particle_containers, particle_grid, Dim_X, Dir_Up, true, Owned);
     // Step 2: exchange along dimension 1, including incoming particles from step 1.
-    shift_exchange(1, -1, y_send_down, y_recv_up, 0, 0, 0, 0);
-    shift_exchange(1, 1, y_send_up, y_recv_down, 0, 0, 0, 0);
-    receive_particles(parts, particle_containers, particle_grid, y_recv_down, false, false);
-    receive_particles(parts, particle_containers, particle_grid, y_recv_up, false, false);
-    x_send_down.resize(0); x_send_up.resize(0);
-    y_send_down.resize(0); y_send_up.resize(0);
+    neighbor_exchange(Dim_Y);
+    receive_particles(parts, particle_containers, particle_grid, Dim_Y, Dir_Down, false, Owned);
+    receive_particles(parts, particle_containers, particle_grid, Dim_Y, Dir_Up, false, Owned);
 }
 
 void gather_for_save(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
